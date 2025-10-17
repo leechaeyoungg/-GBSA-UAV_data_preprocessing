@@ -18,7 +18,7 @@ from albumentations.pytorch import ToTensorV2
 SRC_DIR = r"C:\Users\dromii\Downloads\20250710_ori_migum\20250710_tiled_512\images"
 DST_DIR = r"C:\Users\dromii\Downloads\20250710_ori_migum\20250710_tiled_512\crack_masks"
 
-MODEL_PATH = r"C:\Users\dromii\Downloads\336_hc_unetpp_final_epoch_50.pth"
+MODEL_PATH = r"C:\Users\dromii\Downloads\500_hc_unetpp_final_epoch_100.pth"
 WINDOW_SIZE = (512, 512)
 STRIDE = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
 
@@ -227,12 +227,17 @@ class App:
         return os.path.exists(self.out_path_for(idx)) or (base in self.done)
 
     def jump_to_first_unlabeled(self):
+    # 마지막으로 '저장된 마스크가 있는' 인덱스를 찾는다
+        last_labeled = -1
         for i in range(len(self.files)):
-            if not self.mask_exists_for(i):
-                self.idx = i
-                print(f"[*] Resuming at #{i+1}: {os.path.basename(self.files[i])}")
-                return
-        self.idx = len(self.files); print("[*] 모든 이미지가 이미 라벨링되어 있습니다.]")
+            if self.mask_exists_for(i):
+                last_labeled = i
+
+        start = last_labeled + 1
+        if start < len(self.files):
+            self.idx = start
+            print(f"[*] Resuming after last labeled → #{self.idx+1}: {os.path.basename(self.files[self.idx])}")
+            return
 
     def advance_to_next_unlabeled(self, direction=+1, include_current=False):
         if not self.files: return False
