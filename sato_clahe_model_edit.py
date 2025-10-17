@@ -22,10 +22,10 @@ MODEL_PATH = r"C:\Users\dromii\Downloads\500_hc_unetpp_final_epoch_100.pth"
 WINDOW_SIZE = (512, 512)
 STRIDE = (WINDOW_SIZE[0] // 2, WINDOW_SIZE[1] // 2)
 
-WINDOW_MAIN = "Sato+CLAHE + (Optional) Model Overlay  [L: Original, R: Overlay]"
+WINDOW_MAIN = "Sato+CLAHE + (Optional) Model Overlay  [L: Original Color, R: Color+Mask Overlay]"
 WINDOW_CTRL = "Control (All Params Visible)"
 
-VIEW_SCALE = 0.6
+VIEW_SCALE = 1.0  # 원본 100% 기본
 SAVE_EMPTY_ON_SKIP = False
 # ============================
 
@@ -170,6 +170,20 @@ def overlay_mask(gray_f01, mask_u8, alpha=0.45, color=(0,255,255), scale=1.0):
     out[sel] = (out[sel]*(1-alpha) + np.array(color)*alpha).astype(np.uint8)
     return out
 
+def overlay_mask_on_bgr(bgr_img, mask_u8, alpha=0.45, color=(0,255,255), scale=1.0):
+    base = bgr_img
+    if scale != 1.0:
+        base = cv2.resize(base, (int(base.shape[1]*scale), int(base.shape[0]*scale)), interpolation=cv2.INTER_AREA)
+    mu = cv2.resize(mask_u8, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_NEAREST) if scale != 1.0 else mask_u8
+    out = base.astype(np.float32)
+    sel = mu > 0
+    out[sel] = out[sel]*(1.0 - alpha) + np.array(color, dtype=np.float32)*alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def bgr_scaled(bgr, scale=1.0):
+    if scale == 1.0: return bgr
+    return cv2.resize(bgr, (int(bgr.shape[1]*scale), int(bgr.shape[0]*scale)), interpolation=cv2.INTER_AREA)
+
 def get_gaussian_kernel(window_size, sigma_scale=1./8):
     y, x = np.mgrid[0:window_size[0], 0:window_size[1]]
     cy, cx = (window_size[0]-1)/2., (window_size[1]-1)/2.
@@ -186,6 +200,7 @@ class App:
         ensure_dir(self.dst)
 
         self.done = {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(self.dst, "*.png"))}
+        self.base_to_index = {os.path.splitext(os.path.basename(p))[0]: i for i, p in enumerate(self.files)}
 
         self.idx = 0
         self.rgb = None
@@ -212,9 +227,12 @@ class App:
         self.gray_proc_cache = None; self.gray_proc_key = None
         self.sato_cache = None; self.sato_key = None
 
+        # 보기 배율 상태
+        self.view_scale = VIEW_SCALE
+
         # UI
         self.setup_windows()
-        self.jump_to_first_unlabeled()
+        self.jump_to_first_unlabeled()  # ← 내부 로직을 '마지막 저장 이후'로 변경
         if 0 <= self.idx < len(self.files): self.load(self.files[self.idx])
 
     # ---------- 경로/상태 ----------
@@ -227,17 +245,31 @@ class App:
         return os.path.exists(self.out_path_for(idx)) or (base in self.done)
 
     def jump_to_first_unlabeled(self):
-    # 마지막으로 '저장된 마스크가 있는' 인덱스를 찾는다
-        last_labeled = -1
-        for i in range(len(self.files)):
-            if self.mask_exists_for(i):
-                last_labeled = i
+        """
+        변경점:
+        - DST_DIR 내 *.png 중 '수정시간이 가장 최근'인 마스크 파일을 찾아
+          그 파일에 해당하는 원본의 '다음 인덱스'에서 시작.
+        - 그 다음 인덱스가 이미 라벨링 되어 있다면, 최초 미라벨링 지점까지 전진.
+        """
+        mask_paths = glob.glob(os.path.join(self.dst, "*.png"))
+        start = 0
+        if mask_paths:
+            last_mask = max(mask_paths, key=os.path.getmtime)  # 최신 저장본
+            base = os.path.splitext(os.path.basename(last_mask))[0]
+            last_idx = self.base_to_index.get(base, -1)
+            start = last_idx + 1
 
-        start = last_labeled + 1
-        if start < len(self.files):
-            self.idx = start
-            print(f"[*] Resuming after last labeled → #{self.idx+1}: {os.path.basename(self.files[self.idx])}")
+        i = start
+        while 0 <= i < len(self.files) and self.mask_exists_for(i):
+            i += 1
+
+        if 0 <= i < len(self.files):
+            self.idx = i
+            print(f"[*] Resuming AFTER last saved → #{self.idx+1}: {os.path.basename(self.files[self.idx])}")
             return
+
+        self.idx = len(self.files)
+        print("[*] 모든 이미지가 이미 라벨링되어 있습니다.]")
 
     def advance_to_next_unlabeled(self, direction=+1, include_current=False):
         if not self.files: return False
@@ -270,7 +302,8 @@ class App:
             "  SigmaMax (1..8) / BlackRidges (0/1)\n"
             "  CLAHE enable (0/1), CLAHE clip*10 (0.1~10.0), CLAHE tile k (4,6,...)\n"
             "  Hysteresis Low/High *1000, MinSize, Morph Close, CloseK\n"
-            "  Overlay alpha, Brush size, Use Model, Model Thr*1000"
+            "  Overlay alpha, Brush size, Use Model, Model Thr*1000\n"
+            "  View scale % (25~200)\n"
         )
         self.show_status(help_text, 0)
 
@@ -280,8 +313,7 @@ class App:
         cv2.resizeWindow(WINDOW_MAIN, 1680, 980)
 
         cv2.namedWindow(WINDOW_CTRL, cv2.WINDOW_NORMAL)
-        # >>> 여기만 예전처럼 좁게 변경 <<<
-        cv2.resizeWindow(WINDOW_CTRL, 380, 520)
+        cv2.resizeWindow(WINDOW_CTRL, 380, 560)
         cv2.moveWindow(WINDOW_CTRL, 40, 900)
 
         self.show_help()
@@ -303,6 +335,8 @@ class App:
 
         cv2.createTrackbar("Use Model (0/1)",            WINDOW_CTRL, 0,   1,    self.make_cb("Use Model (0/1)"))
         cv2.createTrackbar("Model Thr *1000",            WINDOW_CTRL, 500, 1000, self.make_cb("Model Thr *1000"))
+
+        cv2.createTrackbar("View scale % (25~200)",      WINDOW_CTRL, int(VIEW_SCALE*100), 200, self.make_cb("View scale %"))
 
         cv2.setMouseCallback(WINDOW_MAIN, self.on_mouse_main)
 
@@ -326,11 +360,14 @@ class App:
         use_model = bool(cv2.getTrackbarPos("Use Model (0/1)", WINDOW_CTRL))
         mthr      = cv2.getTrackbarPos("Model Thr *1000", WINDOW_CTRL) / 1000.0
 
+        vs = max(25, cv2.getTrackbarPos("View scale % (25~200)", WINDOW_CTRL))
+        view_scale = vs / 100.0
+
         return dict(
             sigma=sigma, black=black, use_clahe=use_clahe, clip=clip, tile=tile,
             low=low, high=high, min_size=min_size, use_close=use_close,
             close_k=close_k, alpha=alpha, brush=brush,
-            use_model=use_model, mthr=mthr
+            use_model=use_model, mthr=mthr, view_scale=view_scale
         )
 
     # ---------- 로드 ----------
@@ -463,7 +500,6 @@ class App:
                     crop = padded[y:y+WINDOW_SIZE[0], x:x+WINDOW_SIZE[1]]
                     inp = transform(image=crop)['image'].unsqueeze(0).to(self.device)
                     prob = torch.sigmoid(self.model(inp)).squeeze().detach().cpu().numpy()
-                    out[y:y+WINDOW_SIZE[0], x+x+WINDOW_SIZE[1]-WINDOW_SIZE[1]:x+WINDOW_SIZE[1]]  # (no-op to keep format)
                     out[y:y+WINDOW_SIZE[0], x:x+WINDOW_SIZE[1]] += prob * gkern
                     cnt[y:y+WINDOW_SIZE[0], x:x+WINDOW_SIZE[1]] += gkern
 
@@ -492,7 +528,7 @@ class App:
     def combine_with_model(self, p, sato_base):
         m = self.ensure_model_bin(p)
         if m is None: return sato_base
-        return cv2.bitwise_or(sato_base, m)  # 단순 겹치기
+        return cv2.bitwise_or(sato_base, m)
 
     def compose_final(self, base_combined):
         return cv2.bitwise_and(base_combined, cv2.bitwise_not(self.erase_mask))
@@ -511,14 +547,15 @@ class App:
             return
 
         p = self.get_params()
+        self.view_scale = p["view_scale"]
+
         gray_proc = self.compute_gray_proc_cached(p)
         _, base_sato = self.compute_sato_cached(p, gray_proc)
         base_combined = self.combine_with_model(p, base_sato)
         final = self.compose_final(base_combined)
 
-        left = colorize_gray(self.gray, scale=VIEW_SCALE)
-        right_base = gray_proc if p["use_clahe"] else self.gray
-        right = overlay_mask(right_base, final, alpha=p["alpha"], scale=VIEW_SCALE)
+        left  = bgr_scaled(self.bgr, self.view_scale)
+        right = overlay_mask_on_bgr(self.bgr, final, alpha=p["alpha"], scale=self.view_scale)
 
         panel = np.hstack([left, right])
         cv2.imshow(WINDOW_MAIN, panel)
@@ -528,15 +565,15 @@ class App:
         rx, ry, rw, rh = rect
         if not (rx <= x < rx+rw and ry <= y < ry+rh): return None
         lx = x - rx; ly = y - ry
-        ix = int(lx / VIEW_SCALE); iy = int(ly / VIEW_SCALE)
+        ix = int(lx / self.view_scale); iy = int(ly / self.view_scale)
         if 0 <= ix < self.W and 0 <= iy < self.H: return (ix, iy)
         return None
 
     def on_mouse_main(self, event, mx, my, flags, param):
         p = self.get_params(); brush = p["brush"]
-        disp_w = int(self.W * VIEW_SCALE)
-        left_rect  = (0, 0, disp_w, int(self.H * VIEW_SCALE))
-        right_rect = (disp_w, 0, disp_w, int(self.H * VIEW_SCALE))
+        disp_w = int(self.W * self.view_scale)
+        left_rect  = (0, 0, disp_w, int(self.H * self.view_scale))
+        right_rect = (disp_w, 0, disp_w, int(self.H * self.view_scale))
 
         if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
             self._stroke_tmp = np.zeros((self.H, self.W), np.uint8)
@@ -546,13 +583,13 @@ class App:
             pos = self.mouse_to_image_xy(mx, my, left_rect) or self.mouse_to_image_xy(mx, my, right_rect)
             if pos is not None:
                 cv2.circle(self._stroke_tmp, pos, brush, 255, -1, lineType=cv2.LINE_AA)
-                cv2.circle(self.erase_mask, pos, brush, 255, -1, lineType=cv2.LINE_AA)  # 지움
+                cv2.circle(self.erase_mask, pos, brush, 255, -1, lineType=cv2.LINE_AA)
 
         if (event == cv2.EVENT_RBUTTONDOWN) or (event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_RBUTTON)):
             pos = self.mouse_to_image_xy(mx, my, left_rect) or self.mouse_to_image_xy(mx, my, right_rect)
             if pos is not None:
                 cv2.circle(self._stroke_tmp, pos, brush, 255, -1, lineType=cv2.LINE_AA)
-                cv2.circle(self.erase_mask, pos, brush, 0,   -1, lineType=cv2.LINE_AA)  # 복원
+                cv2.circle(self.erase_mask, pos, brush, 0,   -1, lineType=cv2.LINE_AA)
 
         if event in (cv2.EVENT_LBUTTONUP, cv2.EVENT_RBUTTONUP):
             if self._stroke_tmp is not None and self._erase_before is not None:
